@@ -1,5 +1,4 @@
 import io
-import os
 import re
 from datetime import datetime, timezone
 from urllib.parse import urlparse
@@ -21,7 +20,21 @@ st.set_page_config(
 
 
 # ============================================================
-# CONSTANTS
+# API CONFIGURATION
+# ============================================================
+
+# Paste your NEW Google API key between the quotation marks.
+GOOGLE_API_KEY = "AIzaSyD7g6oJMAI4CxyoM0oY8M7TVKxCDqfzbvE"
+
+# Google Programmable Search Engine ID.
+GOOGLE_CX = "e639296ccd4574416"
+
+GOOGLE_SEARCH_URL = "https://www.googleapis.com/customsearch/v1"
+OPEN_LIBRARY_URL = "https://openlibrary.org/search.json"
+
+
+# ============================================================
+# SEARCH OPTIONS
 # ============================================================
 
 PLATFORMS = {
@@ -198,35 +211,6 @@ EMAIL_EXTENSIONS = [
 
 
 # ============================================================
-# API CONFIGURATION
-# ============================================================
-
-def get_secret(name):
-    """
-    Read a secret from Streamlit secrets or environment variables.
-    """
-    try:
-        value = st.secrets.get(name)
-
-        if value:
-            return str(value).strip()
-
-    except Exception:
-        pass
-
-    return os.getenv(name, "").strip()
-
-
-# Correct configuration.
-# Do not put the actual API key directly inside this file.
-GOOGLE_API_KEY = get_secret("GOOGLE_API_KEY")
-GOOGLE_CX = get_secret("GOOGLE_CX")
-
-GOOGLE_SEARCH_URL = "https://www.googleapis.com/customsearch/v1"
-OPEN_LIBRARY_URL = "https://openlibrary.org/search.json"
-
-
-# ============================================================
 # QUERY GENERATION
 # ============================================================
 
@@ -245,13 +229,13 @@ def generate_queries(platforms, genres, terms, state, extensions):
     for genre in genres or ["author"]:
         for term in terms or ["indie author"]:
             for domain in selected_domains:
-                pieces = [
+                query_parts = [
                     f'"{term}"',
                     f'"{genre}"',
                 ]
 
                 if state not in ("All States", "Unknown"):
-                    pieces.append(f'"{state}"')
+                    query_parts.append(f'"{state}"')
 
                 if extensions and "All extensions" not in extensions:
                     email_terms = [
@@ -261,16 +245,17 @@ def generate_queries(platforms, genres, terms, state, extensions):
                     ]
 
                     if email_terms:
-                        pieces.append(
+                        query_parts.append(
                             "(" + " OR ".join(email_terms) + ")"
                         )
 
                 prefix = f"site:{domain} " if domain else ""
 
                 queries.append(
-                    prefix + " ".join(pieces)
+                    prefix + " ".join(query_parts)
                 )
 
+    # Google Custom Search supports a maximum of 10 results per request.
     return list(dict.fromkeys(queries))[:30]
 
 
@@ -282,7 +267,7 @@ def google_search(query, limit=10):
     if not GOOGLE_API_KEY or not GOOGLE_CX:
         raise RuntimeError(
             "Google API credentials are missing. "
-            "Configure GOOGLE_API_KEY and GOOGLE_CX."
+            "Add your API key and search engine ID at the top of this file."
         )
 
     limit = max(1, min(int(limit), 10))
@@ -310,12 +295,10 @@ def google_search(query, limit=10):
     if response.status_code != 200:
         try:
             error_data = response.json()
-
             error_message = (
                 error_data.get("error", {}).get("message")
                 or response.text[:300]
             )
-
         except Exception:
             error_message = response.text[:300]
 
@@ -356,14 +339,17 @@ def google_search(query, limit=10):
 # ============================================================
 
 def clean_name(name):
-    return re.sub(
-        r"\s+",
-        " ",
-        name,
-    ).strip(" -|,.")
+    return re.sub(r"\s+", " ", name).strip(" -|,.")
 
 
 def extract_authors(results):
+    """
+    Extract likely author names from Google result titles and snippets.
+
+    This is heuristic-based. Google results do not guarantee that
+    every extracted name is a real author.
+    """
+
     authors = {}
 
     name_patterns = [
@@ -535,9 +521,13 @@ st.caption(
 if not GOOGLE_API_KEY or not GOOGLE_CX:
     st.warning(
         "Google API credentials are not configured. "
-        "Add GOOGLE_API_KEY and GOOGLE_CX before searching."
+        "Paste your new GOOGLE_API_KEY at the top of this file."
     )
 
+
+# ============================================================
+# SIDEBAR SETTINGS
+# ============================================================
 
 with st.sidebar:
     st.header("Search configuration")
@@ -587,6 +577,10 @@ with st.sidebar:
     )
 
 
+# ============================================================
+# SEARCH PREVIEW
+# ============================================================
+
 queries = generate_queries(
     platforms,
     genres,
@@ -595,31 +589,33 @@ queries = generate_queries(
     extensions,
 )
 
-
 st.subheader("Search preview")
 
-col1, col2, col3 = st.columns(3)
+column_one, column_two, column_three = st.columns(3)
 
-col1.metric(
+column_one.metric(
     "Generated queries",
     len(queries),
 )
 
-col2.metric(
+column_two.metric(
     "Maximum Google results",
     len(queries) * min(amount, 10),
 )
 
-col3.metric(
+column_three.metric(
     "Selected email extensions",
     len(extensions),
 )
-
 
 with st.expander("View generated queries"):
     for query in queries:
         st.code(query)
 
+
+# ============================================================
+# SEARCH EXECUTION
+# ============================================================
 
 if st.button(
     "START GOOGLE SEARCH",
@@ -653,9 +649,14 @@ if st.button(
         unique_results = {}
 
         for result in results:
-            unique_results[result["url"]] = result
+            url = result.get("url", "")
 
-        results = list(unique_results.values())
+            if url:
+                unique_results[url] = result
+
+        results = list(
+            unique_results.values()
+        )
 
         status.info(
             "Extracting author candidates..."
@@ -714,6 +715,10 @@ if st.button(
                 hide_index=True,
             )
 
+            # ====================================================
+            # CSV EXPORT
+            # ====================================================
+
             csv_bytes = dataframe.to_csv(
                 index=False
             ).encode("utf-8")
@@ -724,6 +729,10 @@ if st.button(
                 "author_leads.csv",
                 "text/csv",
             )
+
+            # ====================================================
+            # EXCEL EXPORT
+            # ====================================================
 
             excel_buffer = io.BytesIO()
 
@@ -741,8 +750,10 @@ if st.button(
                 "Export Excel",
                 excel_buffer.getvalue(),
                 "author_leads.xlsx",
-                "application/vnd.openxmlformats-officedocument"
-                ".spreadsheetml.sheet",
+                (
+                    "application/vnd.openxmlformats-officedocument."
+                    "spreadsheetml.sheet"
+                ),
             )
 
         else:
