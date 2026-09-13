@@ -115,8 +115,8 @@ def get_secret(name):
     return os.getenv(name, "").strip()
 
 
-GOOGLE_API_KEY = get_secret("GOOGLE_API_KEY")
-GOOGLE_CX = get_secret("GOOGLE_CX")
+GOOGLE_API_KEY = get_secret("AIzaSyD7g6oJMAI4CxyoM0oY8M7TVKxCDqfzbvE")
+GOOGLE_CX = get_secret("e639296ccd4574416")
 
 GOOGLE_SEARCH_URL = "https://www.googleapis.com/customsearch/v1"
 OPEN_LIBRARY_URL = "https://openlibrary.org/search.json"
