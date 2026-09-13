@@ -1,109 +1,101 @@
 import asyncio
 import io
-import re
-from datetime import datetime
+import sys
+from pathlib import Path
 
-import httpx
 import pandas as pd
 import streamlit as st
 
+# Make the repository root importable when Streamlit runs this file.
+ROOT = Path(__file__).resolve().parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-def generate_queries(platforms, genres, synonyms, state):
-    sites = {
-        "X/Twitter": "x.com", "Facebook": "facebook.com",
-        "LinkedIn": "linkedin.com", "Reddit": "reddit.com",
-        "Substack": "substack.com", "Medium": "medium.com"
-    }
-    domains = [sites[p] for p in platforms if p in sites]
-    queries = []
-    for genre in genres or ["author"]:
-        for synonym in synonyms or ["indie author"]:
-            parts = [f'"{synonym}"', f'"{genre}"']
-            if state not in ("All States", "Unknown", ""):
-                parts.append(f'"{state}"')
-            prefix = "" if not domains else "site:" + domains[len(queries) % len(domains)] + " "
-            queries.append(prefix + " ".join(parts))
-    return list(dict.fromkeys(queries))[:30]
+from app.services.boolean_engine import generate_queries
+from app.services.search_engine import MockSearchProvider
+from app.services.author_extractor import extract_authors
+from app.services.openlibrary import verify_author
+from app.services.lead_scoring import score_lead
 
 
-async def mock_search(query, limit):
-    now = datetime.utcnow().isoformat()
-    return [{
-        "title": "Jane Smith | Independent Romance Author",
-        "url": "https://example.com/jane-smith",
-        "domain": "example.com", "snippet": "Jane Smith is a self-published romance author with a 2026 book.",
-        "position": i + 1, "query": query, "timestamp": now
-    } for i in range(min(limit, 2))]
-
-
-def extract_authors(results):
-    found = {}
-    for result in results:
-        text = result.get("title", "") + " " + result.get("snippet", "")
-        match = re.search(r"([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})", text)
-        if match:
-            name = match.group(1).strip()
-            key = " ".join(name.lower().split())
-            found.setdefault(key, {
-                "Author": name, "Website": result.get("url", ""),
-                "State": "UNKNOWN", "Indie Score": 85,
-                "Indie Status": "LIKELY",
-                "Indie Evidence": "Independent or self-published wording found.",
-                "Email": "", "Email Status": "NOT_CHECKED"
-            })
-    return list(found.values())
-
-
-async def openlibrary_books(author, years):
+def run_async(coro):
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            response = await client.get(
-                "https://openlibrary.org/search.json",
-                params={"author": author, "limit": 20}
-            )
-            response.raise_for_status()
-            data = response.json()
-        wanted = set(years)
-        books = []
-        for doc in data.get("docs", []):
-            for year in doc.get("publish_year", []):
-                if not wanted or year in wanted:
-                    books.append({
-                        "Title": doc.get("title", "UNKNOWN"),
-                        "Publication Year": year,
-                        "ISBN": (doc.get("isbn") or [""])[0],
-                        "Genre": (doc.get("subject") or ["UNKNOWN"])[0]
-                    })
-        return books[:10]
-    except Exception:
-        return []
+        return asyncio.run(coro)
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(coro)
+        finally:
+            loop.close()
 
 
-def score_lead(author, books):
-    score = 25 + (20 if books else 0) + (5 if author.get("Website") else 0)
-    score += round(author.get("Indie Score", 0) * 0.25)
-    score = min(100, score)
-    category = ("HOT" if score >= 90 else "STRONG" if score >= 75 else
-                "POTENTIAL" if score >= 60 else "WEAK" if score >= 40 else "LOW")
-    return score, category
+st.set_page_config(
+    page_title="Indie Author Lead Generator V2",
+    page_icon="✍️",
+    layout="wide",
+)
 
-
-st.set_page_config(page_title="Indie Author Lead Generator V2", page_icon="✍️", layout="wide")
 st.title("✍️ Indie Author Lead Generator V2")
-st.caption("Automated author discovery, Open Library verification, and lead scoring")
+st.caption("Automated author discovery, book verification, and lead scoring")
 
 with st.sidebar:
     st.header("Search filters")
-    platforms = st.multiselect("Platforms", ["All platforms", "X/Twitter", "Facebook", "LinkedIn", "Reddit", "Substack", "Medium"], ["All platforms"])
-    genres = st.multiselect("Genres", ["Romance", "Contemporary Romance", "Historical Romance", "Fantasy", "Mystery", "Thriller", "Science Fiction", "Young Adult", "Self-Help", "Business"], ["Romance"])
-    synonyms = st.multiselect("Independent-author synonyms", ["indie author", "independent author", "self-published author", "KDP author", "indie novelist", "author-publisher"], ["indie author", "self-published author"])
-    state = st.selectbox("State", ["All States", "Unknown", "Texas", "California", "Florida", "New York"])
-    years = st.multiselect("Publication years", list(range(2026, 2009, -1)), [2026])
-    amount = st.selectbox("Amount of results per query", [10, 25, 50, 100], index=1)
 
-queries = generate_queries(platforms, genres, synonyms, state)
+    platforms = st.multiselect(
+        "Platforms",
+        ["All platforms", "X/Twitter", "Facebook", "LinkedIn", "Reddit", "Substack", "Medium"],
+        default=["All platforms"],
+    )
+
+    genres = st.multiselect(
+        "Genres",
+        [
+            "Romance", "Contemporary Romance", "Historical Romance",
+            "Fantasy", "Mystery", "Thriller", "Science Fiction",
+            "Young Adult", "Self-Help", "Business",
+        ],
+        default=["Romance"],
+    )
+
+    synonyms = st.multiselect(
+        "Independent-author synonyms",
+        [
+            "indie author", "independent author", "self-published author",
+            "KDP author", "indie novelist", "author-publisher",
+        ],
+        default=["indie author", "self-published author"],
+    )
+
+    state = st.selectbox(
+        "State",
+        ["All States", "Unknown", "Texas", "California", "Florida", "New York"],
+    )
+
+    years = st.multiselect(
+        "Publication years",
+        list(range(2026, 2009, -1)),
+        default=[2026],
+    )
+
+    amount = st.selectbox(
+        "Amount of results per query",
+        [10, 25, 50, 100],
+        index=1,
+    )
+
+filters = {
+    "platforms": platforms,
+    "genres": genres,
+    "synonyms": synonyms,
+    "state": state,
+    "years": years,
+    "amount": amount,
+}
+
+queries = generate_queries(filters)
 st.subheader("Search preview")
 st.write(f"Generated queries: **{len(queries)}**")
+
 with st.expander("View generated queries"):
     for query in queries:
         st.code(query)
@@ -112,26 +104,63 @@ if st.button("START AUTOMATIC SEARCH", type="primary"):
     progress = st.progress(0)
     status = st.empty()
     results = []
-    for i, query in enumerate(queries):
-        results.extend(asyncio.run(mock_search(query, min(amount, 10))))
-        progress.progress((i + 1) / max(len(queries), 1))
-    status.info("Extracting authors and checking Open Library...")
+    provider = MockSearchProvider()
+
+    status.info("Collecting search results...")
+    for index, query in enumerate(queries):
+        results.extend(run_async(provider.search(query, min(amount, 10))))
+        progress.progress((index + 1) / max(len(queries), 1))
+
+    status.info("Extracting and deduplicating authors...")
     authors = extract_authors(results)
     rows = []
-    for i, author in enumerate(authors):
-        books = asyncio.run(openlibrary_books(author["Author"], years))
+
+    for index, author in enumerate(authors):
+        status.info(f"Checking Open Library for {author['name']}...")
+        books = run_async(verify_author(author["name"], years, genres))
         lead_score, category = score_lead(author, books)
-        row = {**author, "Books": len(books), "Latest Book": books[0]["Title"] if books else "UNKNOWN", "Lead Score": lead_score, "Category": category}
-        rows.append(row)
-        progress.progress((i + 1) / max(len(authors), 1))
-    status.success(f"Completed: {len(results)} results and {len(rows)} author candidates.")
+
+        rows.append({
+            "Author": author.get("name", "UNKNOWN"),
+            "Website": author.get("website", ""),
+            "State": author.get("state", "UNKNOWN"),
+            "Indie Score": author.get("indie_score", 0),
+            "Indie Status": author.get("indie_status", "UNCERTAIN"),
+            "Indie Evidence": author.get("indie_evidence", ""),
+            "Books": len(books),
+            "Latest Book": books[0].get("title", "UNKNOWN") if books else "UNKNOWN",
+            "Email": author.get("email", ""),
+            "Email Status": author.get("email_status", "NOT_CHECKED"),
+            "Lead Score": lead_score,
+            "Category": category,
+        })
+        progress.progress((index + 1) / max(len(authors), 1))
+
+    status.success(
+        f"Completed: {len(queries)} queries, {len(results)} results, and {len(rows)} authors."
+    )
+
     if rows:
-        df = pd.DataFrame(rows)
-        st.dataframe(df, use_container_width=True, hide_index=True)
-        st.download_button("Export CSV", df.to_csv(index=False).encode(), "author_leads.csv", "text/csv")
-        buffer = io.BytesIO()
-        with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-            df.to_excel(writer, index=False, sheet_name="Author Leads")
-        st.download_button("Export Excel", buffer.getvalue(), "author_leads.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        dataframe = pd.DataFrame(rows)
+        st.subheader("Author leads")
+        st.dataframe(dataframe, use_container_width=True, hide_index=True)
+
+        st.download_button(
+            "Export CSV",
+            dataframe.to_csv(index=False).encode("utf-8"),
+            "author_leads.csv",
+            "text/csv",
+        )
+
+        excel_buffer = io.BytesIO()
+        with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
+            dataframe.to_excel(writer, index=False, sheet_name="Author Leads")
+
+        st.download_button(
+            "Export Excel",
+            excel_buffer.getvalue(),
+            "author_leads.xlsx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
     else:
         st.warning("No author candidates were found.")
